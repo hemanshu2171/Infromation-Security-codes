@@ -1,8 +1,3 @@
-/*
-*
-* @Author : Lakshay (11912077)
-*
-*/
 #include<bits/stdc++.h>
 #include "valarray"
 using namespace std;

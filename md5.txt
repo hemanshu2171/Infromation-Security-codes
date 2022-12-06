@@ -1,0 +1,730 @@
+"""
+The implementation of the MD5 algorithm is based on the original RFC at
+https://www.ietf.org/rfc/rfc1321.txt and contains optimizations from
+https://en.wikipedia.org/wiki/MD5.
+"""
+
+import struct
+from enum import Enum
+from math import (
+    floor,
+    sin,
+)
+
+from bitarray import bitarray
+
+
+class MD5Buffer(Enum):
+    A = 0x67452301
+    B = 0xEFCDAB89
+    C = 0x98BADCFE
+    D = 0x10325476
+
+
+class MD5(object):
+    _string = None
+    _buffers = {
+        MD5Buffer.A: None,
+        MD5Buffer.B: None,
+        MD5Buffer.C: None,
+        MD5Buffer.D: None,
+    }
+
+    @classmethod
+    def hash(cls, string):
+        cls._string = string
+
+        preprocessed_bit_array = cls._step_2(cls._step_1())
+        cls._step_3()
+        cls._step_4(preprocessed_bit_array)
+        return cls._step_5()
+
+    @classmethod
+    def _step_1(cls):
+        # Convert the string to a bit array.
+        bit_array = bitarray(endian="big")
+        bit_array.frombytes(cls._string.encode("utf-8"))
+
+        # Pad the string with a 1 bit and as many 0 bits required such that
+        # the length of the bit array becomes congruent to 448 modulo 512.
+        # Note that padding is always performed, even if the string's bit
+        # length is already conguent to 448 modulo 512, which leads to a
+        # new 512-bit message block.
+        bit_array.append(1)
+        while len(bit_array) % 512 != 448:
+            bit_array.append(0)
+
+        # For the remainder of the MD5 algorithm, all values are in
+        # little endian, so transform the bit array to little endian.
+        return bitarray(bit_array, endian="little")
+
+    @classmethod
+    def _step_2(cls, step_1_result):
+        # Extend the result from step 1 with a 64-bit little endian
+        # representation of the original message length (modulo 2^64).
+        length = (len(cls._string) * 8) % pow(2, 64)
+        length_bit_array = bitarray(endian="little")
+        length_bit_array.frombytes(struct.pack("<Q", length))
+
+        result = step_1_result.copy()
+        result.extend(length_bit_array)
+        return result
+
+    @classmethod
+    def _step_3(cls):
+        # Initialize the buffers to their default values.
+        for buffer_type in cls._buffers.keys():
+            cls._buffers[buffer_type] = buffer_type.value
+
+    @classmethod
+    def _step_4(cls, step_2_result):
+        # Define the four auxiliary functions that produce one 32-bit word.
+        F = lambda x, y, z: (x & y) | (~x & z)
+        G = lambda x, y, z: (x & z) | (y & ~z)
+        H = lambda x, y, z: x ^ y ^ z
+        I = lambda x, y, z: y ^ (x | ~z)
+
+        # Define the left rotation function, which rotates `x` left `n` bits.
+        rotate_left = lambda x, n: (x << n) | (x >> (32 - n))
+
+        # Define a function for modular addition.
+        modular_add = lambda a, b: (a + b) % pow(2, 32)
+
+        # Compute the T table from the sine function. Note that the
+        # RFC starts at index 1, but we start at index 0.
+        T = [floor(pow(2, 32) * abs(sin(i + 1))) for i in range(64)]
+
+        # The total number of 32-bit words to process, N, is always a
+        # multiple of 16.
+        N = len(step_2_result) // 32
+
+        # Process chunks of 512 bits.
+        for chunk_index in range(N // 16):
+            # Break the chunk into 16 words of 32 bits in list X.
+            start = chunk_index * 512
+            X = [step_2_result[start + (x * 32) : start + (x * 32) + 32] for x in range(16)]
+
+            # Convert the `bitarray` objects to integers.
+            X = [int.from_bytes(word.tobytes(), byteorder="little") for word in X]
+
+            # Make shorthands for the buffers A, B, C and D.
+            A = cls._buffers[MD5Buffer.A]
+            B = cls._buffers[MD5Buffer.B]
+            C = cls._buffers[MD5Buffer.C]
+            D = cls._buffers[MD5Buffer.D]
+
+            # Execute the four rounds with 16 operations each.
+            for i in range(4 * 16):
+                if 0 <= i <= 15:
+                    k = i
+                    s = [7, 12, 17, 22]
+                    temp = F(B, C, D)
+                elif 16 <= i <= 31:
+                    k = ((5 * i) + 1) % 16
+                    s = [5, 9, 14, 20]
+                    temp = G(B, C, D)
+                elif 32 <= i <= 47:
+                    k = ((3 * i) + 5) % 16
+                    s = [4, 11, 16, 23]
+                    temp = H(B, C, D)
+                elif 48 <= i <= 63:
+                    k = (7 * i) % 16
+                    s = [6, 10, 15, 21]
+                    temp = I(B, C, D)
+
+                # The MD5 algorithm uses modular addition. Note that we need a
+                # temporary variable here. If we would put the result in `A`, then
+                # the expression `A = D` below would overwrite it. We also cannot
+                # move `A = D` lower because the original `D` would already have
+                # been overwritten by the `D = C` expression.
+                temp = modular_add(temp, X[k])
+                temp = modular_add(temp, T[i])
+                temp = modular_add(temp, A)
+                temp = rotate_left(temp, s[i % 4])
+                temp = modular_add(temp, B)
+
+                # Swap the registers for the next operation.
+                A = D
+                D = C
+                C = B
+                B = temp
+
+            # Update the buffers with the results from this chunk.
+            cls._buffers[MD5Buffer.A] = modular_add(cls._buffers[MD5Buffer.A], A)
+            cls._buffers[MD5Buffer.B] = modular_add(cls._buffers[MD5Buffer.B], B)
+            cls._buffers[MD5Buffer.C] = modular_add(cls._buffers[MD5Buffer.C], C)
+            cls._buffers[MD5Buffer.D] = modular_add(cls._buffers[MD5Buffer.D], D)
+
+    @classmethod
+    def _step_5(cls):
+        # Convert the buffers to little-endian.
+        A = struct.unpack("<I", struct.pack(">I", cls._buffers[MD5Buffer.A]))[0]
+        B = struct.unpack("<I", struct.pack(">I", cls._buffers[MD5Buffer.B]))[0]
+        C = struct.unpack("<I", struct.pack(">I", cls._buffers[MD5Buffer.C]))[0]
+        D = struct.unpack("<I", struct.pack(">I", cls._buffers[MD5Buffer.D]))[0]
+
+        # Output the buffers in lower-case hexadecimal format.
+        return f"{format(A, '08x')}{format(B, '08x')}{format(C, '08x')}{format(D, '08x')}"
+
+
+
+// md5 algo
+#include <iostream>
+
+#include<string.h>
+
+#include<math.h>
+
+using namespace std;
+typedef union uwb {
+  unsigned w;
+  unsigned char b[4];
+}
+MD5union;
+static unsigned func0(unsigned arr[]) {
+  typedef unsigned DigestArray[4];
+  return (arr[1] & arr[2]) | (~arr[1] & arr[3]);
+}
+static unsigned func1(unsigned arr[]) {
+  return (arr[3] & arr[1]) | (~arr[3] & arr[2]);
+}
+static unsigned func2(unsigned arr[]) {
+  return arr[1] ^ arr[2] ^ arr[3];
+}
+static unsigned func3(unsigned arr[]) {
+  return arr[2] ^ (arr[1] | ~arr[3]);
+}
+typedef unsigned( * DgstFctn)(unsigned a[]);
+static unsigned * calctable(unsigned * k) {
+  double s, pwr;
+  int i;
+  pwr = pow(2.0, 32);
+  for (i = 0; i < 64; i++) {
+    s = fabs(sin(1.0 + i));
+    k[i] = (unsigned)(s * pwr);
+  }
+  return k;
+}
+static unsigned rol(unsigned r, short N) {
+  unsigned mask1 = (1 << N) - 1;
+  return ((r >> (32 - N)) & mask1) | ((r << N) & ~mask1);
+}
+static unsigned * MD5Hash(string msg) {
+  int mlen = msg.length();
+  static DigestArray h0 = {
+    0x67452301,
+    0xEFCDAB89,
+    0x98BADCFE,
+    0x10325476
+  };
+  static DgstFctn ff[] = {
+    &
+    func0,
+    &
+    func1,
+    &
+    func2,
+    &
+    func3
+  };
+  static short M[] = {
+    1,
+    5,
+    3,
+    7
+  };
+  static short O[] = {
+    0,
+    1,
+    5,
+    0
+  };
+  static short rot0[] = {
+    7,
+    12,
+    17,
+    22
+  };
+  static short rot1[] = {
+    5,
+    9,
+    14,
+    20
+  };
+  static short rot2[] = {
+    4,
+    11,
+    16,
+    23
+  };
+  static short rot3[] = {
+    6,
+    10,
+    15,
+    21
+  };
+  static short * rots[] = {
+    rot0,
+    rot1,
+    rot2,
+    rot3
+  };
+  static unsigned kspace[64];
+  static unsigned * k;
+  static DigestArray h;
+  DigestArray arr;
+  DgstFctn fctn;
+  short m, o, g;
+  unsigned f;
+  short * rotn;
+  union {
+    unsigned w[16];
+    char b[64];
+  }
+  mm;
+  int os = 0;
+  int grp, grps, q, p;
+  unsigned char * msg2;
+  if (k == NULL) k = calctable(kspace);
+  for (q = 0; q < 4; q++) h[q] = h0[q]; {
+    grps = 1 + (mlen + 8) / 64;
+    msg2 = (unsigned char * ) malloc(64 * grps);
+    memcpy(msg2, msg.c_str(), mlen);
+    msg2[mlen] = (unsigned char) 0x80;
+    q = mlen + 1;
+    while (q < 64 * grps) {
+      msg2[q] = 0;
+      q++;
+    } {
+      MD5union u;
+      u.w = 8 * mlen;
+      q -= 8;
+      memcpy(msg2 + q, & u.w, 4);
+    }
+  }
+  for (grp = 0; grp < grps; grp++) {
+    memcpy(mm.b, msg2 + os, 64);
+    for (q = 0; q < 4; q++) arr[q] = h[q];
+    for (p = 0; p < 4; p++) {
+      fctn = ff[p];
+      rotn = rots[p];
+      m = M[p];
+      o = O[p];
+      for (q = 0; q < 16; q++) {
+        g = (m * q + o) % 16;
+        f = arr[1] + rol(arr[0] + fctn(arr) + k[q + 16 * p] + mm.w[g], rotn[q % 4]);
+        arr[0] = arr[3];
+        arr[3] = arr[2];
+        arr[2] = arr[1];
+        arr[1] = f;
+      }
+    }
+    for (p = 0; p < 4; p++)
+      h[p] += arr[p];
+    os += 64;
+  }
+  return h;
+}
+static string GetMD5String(string msg) {
+  string str;
+  int j, k;
+  unsigned * d = MD5Hash(msg);
+  MD5union u;
+  for (j = 0; j < 4; j++) {
+    u.w = d[j];
+    char s[9];
+    sprintf(s, "%02x%02x%02x%02x", u.b[0], u.b[1], u.b[2], u.b[3]);
+    str += s;
+  }
+  return str;
+}
+int main() {
+  string input;
+  cin >> input;
+  string output = GetMD5String(input);
+  cout << output;
+  return 0;
+}
+
+// rsa
+#include <bits/stdc++.h>
+
+using namespace std;
+int helper(int x, int n, int C) {
+  stack < int > s;
+  while (x > 1) {
+    if ((x & 1) == 1) {
+      s.push(1);
+    } else {
+      s.push(0);
+    }
+    x >>= 1;
+  }
+  int y = C;
+  while (!s.empty()) {
+    int i = s.top();
+    s.pop();
+    int z = (y * y) % int(n);
+    if (i == 1) {
+      z = (z * int(C)) % int(n);
+    }
+    y = z;
+  }
+  return y;
+}
+int main() {
+  double p, q;
+  p = 53;
+  q = 59;
+  double n = p * q;
+  double qn = (p - 1) * (q - 1);
+  double e; // 1<e<qn such that gcd(e,qn) = 1 
+  for(double i = 2; i<qn; i++){ 
+    if ((int(qn)) % int(i) != 0) {
+        e = i;
+        break;
+    }
+}
+double d; // de mod qn = 1 
+for (int i = 0;; i++) {
+  if ((int(i * qn) + 1) % int(e) == 0) {
+    d = ((i * qn) + 1) / e;
+    break;
+  }
+}
+double msg, C;
+cout << "Data to be encrypted, M = ";
+cin >> msg;
+C = double(int(pow(msg, e)) % int(n));
+cout << "Encrypted data, C = " << C << endl;
+double M1;
+// M1 = int(pow(C,d)) % int(n); 
+int y = helper(d, n, C);
+M1 = y;
+cout << "Decrypted data, M1 = " << M1 << endl;
+return 0;
+}
+
+
+
+// rc4
+#include<bits/stdc++.h>
+
+#include<time.h>
+
+int n = 8;
+using namespace std;
+void print(vector < int > arr) {
+  int n = arr.size();
+  for (int i = 0; i < n; i++) {
+    cout << arr[i];
+  }
+  cout << endl;
+}
+int main() {
+  srand(time(0));
+  vector < int > s(n, 0);
+  for (int i = 0; i < n; i++) {
+    s[i] = i;
+  }
+  int j = 0;
+  int i = 0;
+  vector < int > k(n);
+  for (int i = 0; i < n; i++) {
+    k[i] = (rand() + 10) % 50;
+  }
+  while (i < n) {
+    j = (j + s[i] + k[i]) % n;
+    swap(s[i], s[j]);
+    i++;
+  }
+  i = 0;
+  j = 0;
+  while (i < n) {
+    i++;
+    j = (j + s[i]) % n;
+    swap(s[i], s[j]);
+    int t = (s[i] + s[j]) % n;
+    k[i] = s[t];
+  }
+  vector < int > plain(n);
+  for (int i = 0; i < n; i++) {
+    plain[i] = (rand() + 10) % 50;
+  }
+  cout << "plain text: ";
+  print(plain);
+  vector < int > cipher(n);
+  for (int i = 0; i < n; i++) {
+    cipher[i] = plain[i] ^ k[i];
+  }
+  cout << "cipher text: ";
+  print(cipher);
+}
+
+// ceasoer cipher
+#include <iostream>
+
+#include<string>
+
+#include<vector>
+
+using namespace std;
+string ceaserCypher(string str, int shift) {
+  for (int i = 0; i < str.size(); i++) {
+    str[i] = (char)(((int)(str[i]) - 'A' + shift) % 26 + 'A');
+  }
+  return str;
+}
+int main() {
+  string plain_text = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  cout << ceaserCypher(plain_text, 23) << endl;
+  return 0;
+}
+
+// hill cipher
+#include <iostream>
+
+#include<string>
+
+#include<vector>
+
+using namespace std;
+void convert_key_to_matrix(string key, vector < vector < int >> & key_matrix, int n) {
+  int k = 0;
+  for (int i = 0; i < n; i++) {
+    for (int j = 0; j < n; j++) {
+      key_matrix[i][j] = key[k++] - 'A';
+    }
+  }
+}
+void convert_text_to_matrix(string text, vector < vector < int >> & text_matrix, int n) {
+  for (int i = 0; i < n; i++) {
+    text_matrix[i][0] = text[i] - 'A';
+  }
+}
+string hillCipher(string str, string key) {
+  int n = str.size();
+  vector < vector < int >> key_matrix(n, vector < int > (n));
+  convert_key_to_matrix(key, key_matrix, n);
+  vector < vector < int >> text_matrix(n, vector < int > (1));
+  convert_text_to_matrix(str, text_matrix, n);
+  int multiply_output[n][1];
+  for (int i = 0; i < n; i++) {
+    for (int j = 0; j < 1; j++) {
+      multiply_output[i][j] = 0;
+      for (int k = 0; k < n; k++) {
+        multiply_output[i][j] += (key_matrix[i][k] * text_matrix[k][j]);
+      }
+      multiply_output[i][j] = multiply_output[i][j] % 26;
+    }
+  }
+  string encrypted_string = "";
+  for (int i = 0; i < n; i++) {
+    encrypted_string += (multiply_output[i][0]) + 'A';
+  }
+  return encrypted_string;
+}
+int main() {
+  string hill_plain_text = "ACT";
+  string hill_key = "GYBNQKURP";
+  cout << hillCipher(hill_plain_text, hill_key) << endl;
+  return 0;
+}
+
+// playfair 
+#include <bits/stdc++.h>
+
+using namespace std;
+#define SIZE 30
+void toLowerCase(string & input, int ps) {
+  int i;
+  for (i = 0; i < ps; i++) {
+    if (input[i] > 64 && input[i] < 91)
+      input[i] += 32;
+  }
+}
+int removeSpaces(string & input, int ps) {
+  int i, count = 0;
+  for (i = 0; i < ps; i++)
+    if (input[i] != ' ')
+      input[count++] = input[i];
+  input[count] = '\0';
+  return count;
+}
+void generatekeygridable(string & key, int ks, char keygrid[5][5]) {
+  int i, j, k, flag = 0;
+  int dicty[26] = {
+    0
+  };
+  for (i = 0; i < ks; i++) {
+    if (key[i] != 'j')
+      dicty[key[i] - 97] = 2;
+  }
+  dicty['j' - 97] = 1;
+  i = 0;
+  j = 0;
+  for (k = 0; k < ks; k++) {
+    if (dicty[key[k] - 97] == 2) {
+      dicty[key[k] - 97] -= 1;
+      keygrid[i][j] = key[k];
+      j++;
+      if (j == 5) {
+        i++;
+        j = 0;
+      }
+    }
+  }
+  for (k = 0; k < 26; k++) {
+    if (dicty[k] == 0) {
+      keygrid[i][j] = (char)(k + 97);
+      j++;
+      if (j == 5) {
+        i++;
+        j = 0;
+      }
+    }
+  }
+}
+void search(char keygrid[5][5], char a, char b, int arr[]) {
+  int i, j;
+  if (a == 'j')
+    a = 'i';
+  else if (b == 'j')
+    b = 'i';
+  for (i = 0; i < 5; i++) {
+    for (j = 0; j < 5; j++) {
+      if (keygrid[i][j] == a) {
+        arr[0] = i;
+        arr[1] = j;
+      } else if (keygrid[i][j] == b) {
+        arr[2] = i;
+        arr[3] = j;
+      }
+    }
+  }
+}
+int mod5(int a) {
+  return (a % 5);
+}
+int prepare(string & input, int ptrs) {
+  if (ptrs % 2 != 0) {
+    input[ptrs++] = 'z';
+    input[ptrs] = '\0';
+  }
+  return ptrs;
+}
+void encrypt(string & input, char keygrid[5][5], int ps) {
+  int i, a[4];
+  for (i = 0; i < ps; i += 2) {
+    search(keygrid, input[i], input[i + 1], a);
+    if (a[0] == a[2]) {
+      input[i] = keygrid[a[0]][mod5(a[1] + 1)];
+      input[i + 1] = keygrid[a[0]][mod5(a[3] + 1)];
+    } else if (a[1] == a[3]) {
+      input[i] = keygrid[mod5(a[0] + 1)][a[1]];
+      input[i + 1] = keygrid[mod5(a[2] + 1)][a[1]];
+    } else {
+      input[i] = keygrid[a[0]][a[3]];
+      input[i + 1] = keygrid[a[2]][a[1]];
+    }
+  }
+}
+void encryptByPlayfairCipher(string & input, string key) {
+  char ps, ks, keygrid[5][5];
+  // Key 
+  ks = key.size();
+  ks = removeSpaces(key, ks);
+  toLowerCase(key, ks);
+  // Plaintext 
+  ps = key.size();
+  toLowerCase(input, ps);
+  ps = removeSpaces(input, ps);
+  ps = prepare(input, ps);
+  generatekeygridable(key, ks, keygrid);
+  encrypt(input, keygrid, ps);
+}
+
+
+int helper(int c, int p, int n){
+    int ans= 1;
+    int x = p%n;
+    while(p)
+    {
+        if(p&1){
+            ans = (ans*c)%n;
+
+        }
+        c= c*c;
+        c = c%n;
+        p = p>>1;
+    }
+}
+
+// rc4
+class RC4_Cipher{
+    
+    vector<int> s;
+    
+    vector<int> t;
+    
+    int i,j,n,k,size=256;
+    
+    public:
+    
+    vector<int> Encrypt(vector<int> Key, vector<int> PlainText)
+    {
+        vector<int> CipherText;
+        
+        n = Key.size();
+        
+        s.clear();
+        
+        for(i=0;i<size;i++)
+        {
+            s.push_back(i);
+        }
+        
+        t.clear();
+        
+        for(i=0;i<size;i++)
+        {
+            t.push_back(Key[i%n]);
+        }
+        
+        i=0;
+        j=0;
+        
+        
+        
+        for(i=0;i<size;i++)
+        {
+            j = (j + s[i] + t[i]) % size;
+            
+            swap(s[i], s[j]);
+            
+        }
+        
+        i=0;
+        j=0;
+        
+        while(CipherText.size() != PlainText.size())
+        {
+            i = (i+1) % size;
+            
+            j = (j +s[i]) % size;
+            
+            swap(s[i], s[j]);
+            
+            k = (s[i] + s[j]) % size;
+            
+            CipherText.push_back(s[k]);
+        }
+        
+        for(i=0;i<CipherText.size();i++)
+        {
+            CipherText[i] = CipherText[i] ^ PlainText[i];
+        }
+        
+        return CipherText;
+    }
+    
